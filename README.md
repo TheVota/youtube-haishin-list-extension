@@ -1,139 +1,120 @@
-# VSPO Fan Schedule API
+# YouTube 配信一覧拡張機能
 
-VSPO Fan Schedule API is an unofficial Rails API server for tracking public
-VSPO! VTuber live stream information.
+好きな YouTube チャンネルを登録して、配信中・配信予定の枠を Chrome のポップアップから確認できる拡張機能です。
 
-This project is based on [YunzheZJU/non-stop-story](https://github.com/YunzheZJU/non-stop-story) and swaps the default seed data to VSPO! YouTube and Twitch channels.
+ぶいすぽなど特定のグループ専用ではなく、自分でチャンネルを追加してオリジナルの配信一覧を作れます。
 
-This repository is not affiliated with, endorsed by, or sponsored by VSPO!,
-Virtual Entertainment, Brave group, YouTube, or VTuber Live. Product names,
-channel names, and service names belong to their respective owners.
+## 主な機能
 
-## Browser Extension
+- YouTube チャンネルを自由に追加
+- 配信中の枠と配信予定の枠をタブで切り替え
+- 配信中の件数を拡張機能アイコンのバッジに表示
+- 配信開始からの経過時間を表示
+- 新しい配信順に一覧表示
+- YouTube のみ対応
 
-The `extension/` directory contains a Chrome Manifest V3 popup extension for
-building a custom YouTube live stream list.
+## 導入方法
 
-Open the extension options page and add YouTube channels by URL, channel ID, or
-`@handle`. The popup fetches each registered channel's YouTube streams page and
-shows live and scheduled streams.
+Chrome ウェブストアには公開していないため、手動で Chrome に読み込みます。
 
-To try it in Chrome:
+### 1. ファイルをダウンロードする
 
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Choose "Load unpacked".
-4. Select the `extension/` directory.
+1. この GitHub ページの右上にある緑色の `Code` ボタンをクリック
+2. `Download ZIP` をクリック
+3. ダウンロードした ZIP ファイルを右クリックして展開
+4. 展開したフォルダを分かりやすい場所に置く
 
-## What It Provides
-
-REST endpoints:
+例:
 
 ```text
-/api/v1/lives/current
-/api/v1/lives/scheduled
-/api/v1/lives/ended
-/api/v1/lives/open
-/api/v1/lives/1
-/api/v1/members
-/api/v1/channels
-/api/v1/platforms
-/api/v1/rooms
-/api/v1/hotnesses
+ドキュメント/youtube-haishin-list-extension
 ```
 
-GraphQL endpoint:
+### 2. Chrome に拡張機能を読み込む
+
+1. Chrome を開く
+2. アドレスバーに `chrome://extensions` と入力して Enter
+3. 右上の「デベロッパー モード」をオンにする
+4. 左上に表示される「パッケージ化されていない拡張機能を読み込む」をクリック
+5. さきほど展開したフォルダの中にある `extension` フォルダを選択
+
+選択するのは、リポジトリ全体のフォルダではなく `extension` フォルダです。
 
 ```text
-/graphql
+youtube-haishin-list-extension/extension
 ```
 
-## Seed Data
+読み込みに成功すると、Chrome の拡張機能一覧に `YouTube Live List` が表示されます。
 
-`db/seeds.yml` contains the current VSPO! YouTube and Twitch channel list used to initialize members and channels.
+うまく読み込めない場合は、選択しているフォルダが間違っている可能性があります。`manifest.json` が入っている `extension` フォルダを選び直してください。
 
-The list was generated from the public VTuber Live VSPO channel page on 2026-06-07:
+### 3. チャンネルを追加する
 
-https://vtuber-live.net/prod_ch_list?prd=vspo
+1. Chrome 右上の拡張機能アイコンから `YouTube Live List` を開く
+2. ポップアップ右上の「チャンネル追加」をクリック
+3. 表示名と YouTube チャンネル URL を入力
+4. 「追加」をクリック
+5. ポップアップに戻ると、登録したチャンネルの配信中・配信予定が表示されます
 
-Current seed scope:
+表示名は空欄でも使えます。その場合、一覧では YouTube から取得したチャンネル名を表示します。
 
-- YouTube and confirmed Twitch channels
-- 32 VSPO! / VSPO! EN channels
-- All members marked active by default
+拡張機能アイコンが見つからない場合は、Chrome 右上のパズルのようなアイコンをクリックして、`YouTube Live List` をピン留めしてください。
 
-The seed data is intended as a convenience snapshot of public channel metadata.
-Check the source pages and the relevant service terms before using it in a
-public service or redistribution.
+## 更新方法
 
-## Public Release Notes
+このリポジトリを再ダウンロードした場合は、古いフォルダを新しいフォルダに置き換えてから、`chrome://extensions` の `YouTube Live List` にある再読み込みボタンを押してください。
 
-Before publishing your own fork, check these items:
+## チャンネルの追加方法
 
-- Keep the original MIT `LICENSE` file and copyright notice.
-- Do not commit `config/master.key`, `.env` files, real worker URLs, API keys,
-  SMTP passwords, or production credentials.
-- Review `config/credentials.yml.enc`; regenerate or remove it if it has ever
-  contained real secrets.
-- Use only icons and images that you created or have permission to redistribute.
-- Make the project description clearly say this is an unofficial fan-made tool.
-
-## Workers
-
-Workers are external services that receive channel IDs and return live stream information. Configure them in `config/worker.yml`.
-
-The app expects workers for:
-
-```yaml
-lives_detect:
-  youtube:
-    - https://your-detect-worker.example
-  twitch:
-    - worker: https://your-twitch-detect-worker.example
-      proxy: http://your-proxy.example:1234
-lives_check:
-  youtube:
-    - https://your-check-worker.example
-  twitch:
-    - worker: https://your-twitch-check-worker.example
-      proxy: http://your-proxy.example:1234
-members_track:
-  youtube:
-    - https://your-member-worker.example
-```
-
-Sample worker implementations from the original project are available here:
-
-https://github.com/YunzheZJU/holo-schedule-workers
-
-## Setup
-
-Ruby version:
+設定画面では、以下の形式でチャンネルを追加できます。
 
 ```text
-2.6.5
+https://www.youtube.com/@handle
+https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx
+@handle
 ```
 
-Install dependencies:
+表示名を空欄にした場合でも、一覧では YouTube から取得したチャンネル名を表示します。
 
-```bash
-bundle install
+## フォルダ構成
+
+```text
+extension/
+  manifest.json
+  popup.html
+  popup.css
+  popup.js
+  options.html
+  options.css
+  options.js
+  background.js
+  shared.js
+  icons/
 ```
 
-Initialize the database:
+Chrome に読み込む対象は `extension` フォルダです。
 
-```bash
-bundle exec rails db:setup
-```
+## よくあるつまずき
 
-Run tests:
+### 「マニフェスト ファイルが見つからない」と表示される
 
-```bash
-bundle exec rails t
-```
+選択するフォルダが違います。`youtube-haishin-list-extension` フォルダそのものではなく、その中にある `extension` フォルダを選択してください。
 
-Run the server:
+### チャンネルを追加しても何も表示されない
 
-```bash
-bundle exec rails s
-```
+登録したチャンネルに現在の配信中・配信予定がない場合、一覧は空になります。別のチャンネルを追加するか、時間をおいて更新ボタンを押してください。
+
+### 拡張機能を更新したのに表示が変わらない
+
+`chrome://extensions` を開き、`YouTube Live List` の再読み込みボタンを押してください。
+
+## 注意事項
+
+- この拡張機能は非公式ツールです。
+- YouTube のページ構造を読み取って表示しているため、YouTube 側の仕様変更で動かなくなる可能性があります。
+- API キーは使用していません。
+- 登録したチャンネル情報は Chrome のローカルストレージに保存されます。
+
+## ライセンス
+
+MIT License
