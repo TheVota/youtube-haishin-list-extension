@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Unofficial VSPO Live Status",
-  "description": "Unofficial fan-made popup for public VSPO! YouTube and Twitch stream listings.",
-  "version": "0.1.1",
+  "name": "YouTube Live List",
+  "description": "Create a custom popup list of live and scheduled YouTube streams.",
+  "version": "0.2.0",
   "permissions": [
     "alarms",
     "storage"
@@ -12,7 +12,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Unofficial VSPO Live Status",
+    "default_title": "YouTube Live List",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
@@ -28,8 +28,8 @@
     "128": "icons/icon128.png"
   },
   "host_permissions": [
-    "https://vtuber-live.net/*",
+    "https://www.youtube.com/*",
     "https://i.ytimg.com/*",
-    "https://static-cdn.jtvnw.net/*"
+    "https://yt3.ggpht.com/*"
   ]
 }

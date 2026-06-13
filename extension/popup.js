@@ -1,15 +1,8 @@
-const SOURCES = {
-  live: "https://vtuber-live.net/live?filter=vspo",
-  scheduled: "https://vtuber-live.net/live_schedule?filter=vspo"
-};
-
-const STORAGE_KEY = "selectedMemberIds";
-
 const state = {
   view: "live",
   live: [],
   scheduled: [],
-  selectedMemberIds: new Set(VSPO_DEFAULT_MEMBER_IDS),
+  streamers: [],
   loading: false
 };
 
@@ -31,8 +24,7 @@ tabs.forEach((tab) => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === "local" && changes[STORAGE_KEY]) {
-    state.selectedMemberIds = new Set(changes[STORAGE_KEY].newValue || VSPO_DEFAULT_MEMBER_IDS);
+  if (areaName === "local" && changes[STREAMERS_STORAGE_KEY]) {
     refresh();
   }
 });
@@ -43,35 +35,50 @@ async function refresh() {
   setLoading(true);
 
   try {
-    state.selectedMemberIds = new Set(await getSelectedMemberIds());
-    const [liveHtml, scheduledHtml] = await Promise.all([
-      fetchText(SOURCES.live),
-      fetchText(SOURCES.scheduled)
-    ]);
+    state.streamers = await getStoredStreamers();
+    if (!state.streamers.length) {
+      state.live = [];
+      state.scheduled = [];
+      updateActionBadge(0);
+      updatedAt.textContent = "配信者が未設定";
+      render();
+      return;
+    }
 
-    const liveItems = parseStreams(liveHtml, "live").filter((item) => item.isLive);
-    const scheduledItems = parseStreams(scheduledHtml, "scheduled").filter((item) => !item.isLive);
-    const twitchLiveItems = await fetchTwitchLiveItems();
+    const results = await Promise.allSettled(state.streamers.map(fetchStreamerStreams));
+    const streams = results
+      .filter((result) => result.status === "fulfilled")
+      .flatMap((result) => result.value);
 
-    state.live = mergeStreams(liveItems, twitchLiveItems).filter(shouldShowStream);
-    state.scheduled = scheduledItems.filter(shouldShowStream).slice(0, 20);
+    state.live = sortStreams(uniqueStreams(streams.filter((item) => item.isLive)));
+    state.scheduled = sortStreams(uniqueStreams(streams.filter((item) => !item.isLive))).slice(0, 30);
     updateActionBadge(state.live.length);
     updatedAt.textContent = `${new Intl.DateTimeFormat("ja-JP", {
       hour: "2-digit",
       minute: "2-digit"
-    }).format(new Date())} \u66f4\u65b0`;
+    }).format(new Date())} 更新`;
     render();
   } catch (error) {
-    showMessage("\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u6642\u9593\u3092\u304a\u3044\u3066\u66f4\u65b0\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+    showMessage("取得に失敗しました。時間をおいて更新してください。");
     console.error(error);
   } finally {
     setLoading(false);
   }
 }
 
-async function getSelectedMemberIds() {
-  const values = await chrome.storage.local.get({ [STORAGE_KEY]: VSPO_DEFAULT_MEMBER_IDS });
-  return Array.isArray(values[STORAGE_KEY]) ? values[STORAGE_KEY] : VSPO_DEFAULT_MEMBER_IDS;
+async function fetchStreamerStreams(streamer) {
+  const html = await fetchText(streamer.streamsUrl);
+  const data = extractInitialData(html);
+  const renderers = findStreamRenderers(data);
+  const channelName = getChannelName(data) || streamer.name;
+  const resolvedStreamer = { ...streamer, name: channelName };
+
+  const items = renderers
+    .map((renderer) => createStreamItem(renderer, resolvedStreamer))
+    .filter(Boolean)
+    .filter((item) => !isFreeChat(item));
+
+  return Promise.all(items.map(enrichLiveStreamTiming));
 }
 
 async function fetchText(url) {
@@ -82,169 +89,269 @@ async function fetchText(url) {
   return response.text();
 }
 
-function parseStreams(html, status) {
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  return [...doc.querySelectorAll(".main_body .v_r.v_rect_l")]
-    .map((card) => parseCard(card, status))
-    .filter(Boolean);
+function extractInitialData(html) {
+  const match = html.match(/ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+  if (!match) throw new Error("ytInitialData not found");
+  return JSON.parse(match[1]);
 }
 
-async function fetchTwitchLiveItems() {
-  const members = getSelectedTwitchMembers();
-  const results = await Promise.allSettled(members.map(fetchTwitchLiveItem));
-  return results
-    .filter((result) => result.status === "fulfilled" && result.value)
-    .map((result) => result.value);
-}
+function extractInitialPlayerResponse(html) {
+  const markerIndex = html.indexOf("ytInitialPlayerResponse");
+  if (markerIndex < 0) return null;
 
-function getSelectedTwitchMembers() {
-  return VSPO_MEMBERS
-    .map((member) => ({
-      ...member,
-      twitchLogin: (member.ids || []).find((id) => !id.startsWith("UC"))
-    }))
-    .filter((member) => member.twitchLogin && state.selectedMemberIds.has(member.id));
-}
+  const start = html.indexOf("{", markerIndex);
+  if (start < 0) return null;
 
-async function fetchTwitchLiveItem(member) {
-  const login = member.twitchLogin.toLowerCase();
-  const thumbnail = getTwitchThumbnail(login);
-  const isLive = await isTwitchPreviewLive(thumbnail);
-  if (!isLive) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
 
-  return {
-    id: login,
-    channelId: login,
-    platform: "twitch",
-    status: "live",
-    isLive: true,
-    title: `${member.name} - Twitch`,
-    member: member.name,
-    thumbnail,
-    meta: "Twitch配信中",
-    url: `https://www.twitch.tv/${login}`
-  };
-}
+  for (let index = start; index < html.length; index += 1) {
+    const char = html[index];
 
-async function isTwitchPreviewLive(thumbnail) {
-  const response = await fetch(thumbnail, { method: "HEAD", cache: "no-store" });
-  if (!response.ok) return false;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
 
-  const contentLength = Number(response.headers.get("content-length")) || 0;
-  return contentLength > 3000;
-}
-
-function getTwitchThumbnail(login) {
-  return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${login}-320x180.jpg`;
-}
-
-function mergeStreams(...streamGroups) {
-  const streams = streamGroups.flat();
-  const seen = new Set();
-  return streams.filter((stream) => {
-    const key = `${stream.platform}:${stream.id}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function parseCard(card, status) {
-  const stream = getStream(card);
-  const channelId = getChannelId(card);
-  if (!stream || !channelId) return null;
-
-  const titleLink = card.querySelector(".v_title");
-  const channelLink = card.querySelector(".c_title");
-  const thumb = card.querySelector(".v_img img:not(.ls_now)");
-  const concurrent = card.querySelector(".v_ccnt")?.textContent.trim() || "";
-  const dateText = [...card.childNodes]
-    .map((node) => node.textContent?.trim() || "")
-    .find((text) => /^\d{4}\/\d{2}\/\d{2}/.test(text)) || "";
-  const startsAt = parseStartDate(dateText);
-  const isLive = status === "live" && Boolean(card.querySelector(".ls_now"));
-
-  return {
-    id: stream.id,
-    channelId,
-    platform: stream.platform,
-    status,
-    isLive,
-    title: clean(titleLink?.getAttribute("title") || titleLink?.textContent || "Untitled"),
-    member: clean(channelLink?.getAttribute("title") || channelLink?.textContent || "VSPO!"),
-    thumbnail: thumb?.src || stream.thumbnail,
-    meta: clean([concurrent, formatRelativeTime(startsAt) || dateText].filter(Boolean).join(" / ")),
-    url: stream.url
-  };
-}
-
-function getStream(card) {
-  const link = getStreamLink(card);
-  const youtubeId = getYouTubeVideoId(card, link);
-  if (youtubeId) {
-    return {
-      id: youtubeId,
-      platform: "youtube",
-      thumbnail: `https://i.ytimg.com/vi/${youtubeId}/mqdefault.jpg`,
-      url: `https://www.youtube.com/watch?v=${youtubeId}`
-    };
-  }
-
-  const twitchLogin = getTwitchLogin(link);
-  if (twitchLogin) {
-    return {
-      id: twitchLogin,
-      platform: "twitch",
-      thumbnail: getTwitchThumbnail(twitchLogin),
-      url: `https://www.twitch.tv/${twitchLogin}`
-    };
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return JSON.parse(html.slice(start, index + 1));
+      }
+    }
   }
 
   return null;
 }
 
-function getStreamLink(card) {
-  const href = card.querySelector(".v_title[href], a[href*='youtube.com/watch'], a[href*='youtu.be/'], a[href*='twitch.tv/']")?.getAttribute("href") || "";
-  return href ? new URL(href, "https://vtuber-live.net").href : "";
+function findStreamRenderers(root) {
+  const renderers = [];
+  const stack = [root];
+
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object") continue;
+
+    if (value.videoRenderer?.videoId) {
+      renderers.push(value.videoRenderer);
+      continue;
+    }
+
+    if (value.lockupViewModel?.contentId || value.lockupViewModel?.rendererContext?.commandContext) {
+      renderers.push(value.lockupViewModel);
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      stack.push(...value);
+    } else {
+      stack.push(...Object.values(value));
+    }
+  }
+
+  return renderers;
 }
 
-function getYouTubeVideoId(card, link) {
-  const classId = [...card.classList]
-    .map((name) => name.match(/^vr-([A-Za-z0-9_-]{11})$/)?.[1])
-    .find(Boolean);
-  if (classId) return classId;
+function getChannelName(root) {
+  const stack = [root];
 
-  const linkId = link.match(/[?&]v=([A-Za-z0-9_-]{11})/)?.[1] || link.match(/youtu\.be\/([A-Za-z0-9_-]{11})/)?.[1];
-  if (linkId) return linkId;
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object") continue;
 
-  const imageId = card.querySelector("img[src*='i.ytimg.com/vi/']")?.src.match(/\/vi\/([A-Za-z0-9_-]{11})\//)?.[1];
-  return imageId || null;
+    const title = value.channelMetadataRenderer?.title || value.pageHeaderRenderer?.pageTitle;
+    if (title) return clean(title);
+
+    if (Array.isArray(value)) {
+      stack.push(...value);
+    } else {
+      stack.push(...Object.values(value));
+    }
+  }
+
+  return "";
 }
 
-function getChannelId(card) {
-  const youtubeHref = card.querySelector(".c_title[href*='/channel/']")?.getAttribute("href") || "";
-  const youtubeId = youtubeHref.match(/\/channel\/(UC[\w-]+)/)?.[1];
-  if (youtubeId) return youtubeId;
+function createStreamItem(renderer, streamer) {
+  if (renderer.contentId || renderer.rendererContext?.commandContext) {
+    return createLockupStreamItem(renderer, streamer);
+  }
 
-  const twitchHref = card.querySelector(".c_title[href*='twitch.tv/'], a[href*='twitch.tv/']")?.getAttribute("href") || "";
-  return getTwitchLogin(twitchHref);
+  const videoId = renderer.videoId;
+  if (!videoId) return null;
+
+  const title = getText(renderer.title) || "Untitled";
+  const isLive = isLiveRenderer(renderer);
+  const isScheduled = Boolean(renderer.upcomingEventData) || hasBadge(renderer, "UPCOMING") || hasBadge(renderer, "予定");
+  if (!isLive && !isScheduled) return null;
+
+  const startsAt = Number(renderer.upcomingEventData?.startTime || 0) * 1000 || null;
+  const metaParts = [
+    getText(renderer.shortViewCountText),
+    startsAt ? formatRelativeTime(new Date(startsAt)) : getText(renderer.publishedTimeText)
+  ].filter(Boolean);
+
+  return {
+    id: videoId,
+    channelId: streamer.key,
+    platform: "youtube",
+    isLive,
+    startsAt,
+    title: clean(title),
+    member: streamer.name,
+    thumbnail: getBestThumbnail(renderer.thumbnail) || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+    meta: clean(metaParts.join(" / ")),
+    url: `https://www.youtube.com/watch?v=${videoId}`
+  };
 }
 
-function getTwitchLogin(link) {
-  const login = link.match(/twitch\.tv\/(?!videos\/)([A-Za-z0-9_]+)/)?.[1];
-  return login ? login.toLowerCase() : null;
+function createLockupStreamItem(lockup, streamer) {
+  const videoId = lockup.contentId || lockup.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId;
+  if (!videoId) return null;
+
+  const statusText = getLockupStatusText(lockup);
+  const isLive = /live|ライブ配信中|配信中|watching|視聴中/i.test(statusText);
+  const isScheduled = /upcoming|scheduled|premiere|予定|待機中/i.test(statusText);
+  if (!isLive && !isScheduled) return null;
+
+  const title = lockup.metadata?.lockupMetadataViewModel?.title?.content || getText(lockup.metadata?.lockupMetadataViewModel?.title) || "Untitled";
+  const elapsedMs = isLive ? parseLiveDurationMs(statusText) : null;
+  const startsAt = elapsedMs ? Date.now() - elapsedMs : parseScheduledStartTime(statusText);
+  const meta = isLive
+    ? [getLiveViewerText(statusText), elapsedMs ? formatElapsed(elapsedMs) : ""].filter(Boolean).join(" / ")
+    : getLockupMetadata(lockup);
+
+  return {
+    id: videoId,
+    channelId: streamer.key,
+    platform: "youtube",
+    isLive,
+    startsAt,
+    title: clean(title),
+    member: streamer.name,
+    thumbnail: getBestSource(lockup.contentImage?.thumbnailViewModel?.image) || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+    meta: clean(meta),
+    url: `https://www.youtube.com/watch?v=${videoId}`
+  };
+}
+
+async function enrichLiveStreamTiming(item) {
+  if (!item.isLive || item.startsAt) return item;
+
+  try {
+    const startsAt = await fetchLiveStartTime(item.id);
+    if (!startsAt) return item;
+
+    return {
+      ...item,
+      startsAt,
+      meta: formatLiveMeta(item.meta, startsAt)
+    };
+  } catch (error) {
+    console.warn(`Failed to fetch live start time for ${item.id}`, error);
+    return item;
+  }
+}
+
+async function fetchLiveStartTime(videoId) {
+  const html = await fetchText(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`);
+  const playerResponse = extractInitialPlayerResponse(html);
+  const startTimestamp = playerResponse?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.startTimestamp;
+  if (!startTimestamp) return null;
+
+  const startsAt = new Date(startTimestamp).getTime();
+  return Number.isNaN(startsAt) ? null : startsAt;
+}
+
+function formatLiveMeta(meta, startsAt) {
+  const viewerText = getLiveViewerText(meta);
+  const elapsedText = formatElapsed(Date.now() - startsAt);
+  return [viewerText, elapsedText].filter(Boolean).join(" / ");
+}
+
+function isLiveRenderer(renderer) {
+  return Boolean(renderer.badges?.some((badge) => {
+    const style = badge.metadataBadgeRenderer?.style || "";
+    const label = badge.metadataBadgeRenderer?.label || "";
+    return style.includes("LIVE") || /live|配信中/i.test(label);
+  })) || getText(renderer.thumbnailOverlays).match(/live|配信中/i);
+}
+
+function hasBadge(renderer, text) {
+  const pattern = new RegExp(text, "i");
+  return JSON.stringify(renderer.badges || []).match(pattern);
+}
+
+function getBestThumbnail(thumbnail) {
+  const thumbnails = thumbnail?.thumbnails || [];
+  return thumbnails[thumbnails.length - 1]?.url || "";
+}
+
+function getBestSource(image) {
+  const sources = image?.sources || [];
+  return sources[sources.length - 1]?.url || "";
+}
+
+function getLockupMetadata(lockup) {
+  const rows = lockup.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
+  return rows
+    .flatMap((row) => row.metadataParts || [])
+    .map((part) => part.text?.content || part.accessibilityLabel || getText(part.text))
+    .filter(Boolean)
+    .join(" / ");
+}
+
+function getLockupStatusText(lockup) {
+  const badgeText = (lockup.contentImage?.thumbnailViewModel?.overlays || [])
+    .flatMap((overlay) => overlay.thumbnailBottomOverlayViewModel?.badges || [])
+    .map((badge) => getText(badge.thumbnailBadgeViewModel))
+    .filter(Boolean)
+    .join(" ");
+
+  return [getLockupMetadata(lockup), badgeText].filter(Boolean).join(" ");
+}
+
+function getText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(getText).filter(Boolean).join(" ");
+  if (value.simpleText) return value.simpleText;
+  if (value.text) return value.text;
+  if (value.runs) return value.runs.map(getText).filter(Boolean).join("");
+  if (typeof value === "object") return Object.values(value).map(getText).filter(Boolean).join(" ");
+  return "";
+}
+
+function uniqueStreams(streams) {
+  const seen = new Set();
+  return streams.filter((stream) => {
+    if (seen.has(stream.id)) return false;
+    seen.add(stream.id);
+    return true;
+  });
+}
+
+function sortStreams(streams) {
+  return [...streams].sort((a, b) => {
+    if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+    if (a.isLive) return (b.startsAt || 0) - (a.startsAt || 0);
+    return (a.startsAt || Number.MAX_SAFE_INTEGER) - (b.startsAt || Number.MAX_SAFE_INTEGER);
+  });
 }
 
 function clean(value) {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function parseStartDate(value) {
-  const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2})\([^)]*\)\s+(\d{2}):(\d{2})/);
-  if (!match) return null;
-
-  const [, year, month, day, hour, minute] = match;
-  return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute));
+  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 function formatRelativeTime(date) {
@@ -252,40 +359,76 @@ function formatRelativeTime(date) {
 
   const diffMinutes = Math.round((Date.now() - date.getTime()) / 60000);
   const absMinutes = Math.abs(diffMinutes);
-  const suffix = diffMinutes >= 0 ? "\u524d" : "\u5f8c";
+  const suffix = diffMinutes >= 0 ? "前" : "後";
 
-  if (absMinutes < 1) return diffMinutes >= 0 ? "\u305f\u3060\u3044\u307e\u958b\u59cb" : "\u307e\u3082\u306a\u304f";
-  if (absMinutes < 60) return `${absMinutes}\u5206${suffix}`;
+  if (absMinutes < 1) return diffMinutes >= 0 ? "ただいま開始" : "まもなく";
+  if (absMinutes < 60) return `${absMinutes}分${suffix}`;
 
   const hours = Math.floor(absMinutes / 60);
   const minutes = absMinutes % 60;
   if (hours < 24) {
-    return minutes > 0 ? `${hours}\u6642\u9593${minutes}\u5206${suffix}` : `${hours}\u6642\u9593${suffix}`;
+    return minutes > 0 ? `${hours}時間${minutes}分${suffix}` : `${hours}時間${suffix}`;
   }
 
   const days = Math.floor(hours / 24);
-  return `${days}\u65e5${suffix}`;
+  return `${days}日${suffix}`;
 }
 
-function shouldShowStream(item) {
-  return !isFreeChat(item) && isSelectedChannel(item.channelId);
+function formatElapsed(ms) {
+  const totalMinutes = Math.max(0, Math.floor(ms / 60000));
+  if (totalMinutes < 1) return "たった今";
+  if (totalMinutes < 60) return `${totalMinutes}分前`;
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours < 24) {
+    return minutes > 0 ? `${hours}時間${minutes}分前` : `${hours}時間前`;
+  }
+
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours > 0 ? `${days}日${restHours}時間前` : `${days}日前`;
 }
 
-function isSelectedChannel(channelId) {
-  const memberId = VSPO_CHANNEL_MEMBER_ID_MAP[channelId.toLowerCase()] || channelId;
-  return state.selectedMemberIds.has(memberId);
+function parseLiveDurationMs(value) {
+  const text = String(value || "");
+  const match = text.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return null;
+
+  const first = Number(match[1]);
+  const second = Number(match[2]);
+  const third = Number(match[3] || 0);
+  const seconds = match[3] ? (first * 3600) + (second * 60) + third : (first * 60) + second;
+  return seconds * 1000;
+}
+
+function parseScheduledStartTime(value) {
+  const match = String(value || "").match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+
+  const [, year, month, day, hour, minute] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute)).getTime();
+}
+
+function getLiveViewerText(value) {
+  return String(value || "").match(/[\d,.万億]+\s*人が視聴中/)?.[0] || "";
 }
 
 function isFreeChat(item) {
-  return /free\s*chat|\u30d5\u30ea\u30fc\s*\u30c1\u30e3\u30c3\u30c8|\u30d5\u30ea\u30c1\u30e3/i.test(`${item.title} ${item.member}`);
+  return /free\s*chat|フリー\s*チャット|フリチャ/i.test(`${item.title} ${item.member}`);
 }
 
 function render() {
   const items = state[state.view];
   list.replaceChildren();
 
+  if (!state.streamers.length) {
+    showMessage("設定画面で YouTube チャンネルを追加してください。");
+    return;
+  }
+
   if (!items.length) {
-    showMessage(state.view === "live" ? "\u73fe\u5728\u914d\u4fe1\u4e2d\u306e\u67a0\u306f\u3042\u308a\u307e\u305b\u3093\u3002" : "\u8868\u793a\u3067\u304d\u308b\u4e88\u5b9a\u67a0\u304c\u3042\u308a\u307e\u305b\u3093\u3002");
+    showMessage(state.view === "live" ? "現在配信中の枠はありません。" : "表示できる予定枠がありません。");
     return;
   }
 
@@ -300,8 +443,7 @@ function createCard(item) {
   card.target = "_blank";
   card.rel = "noreferrer";
 
-  const badgeLabel = item.isLive ? "LIVE" : "\u4e88\u5b9a";
-  const platformLabel = formatPlatform(item.platform);
+  const badgeLabel = item.isLive ? "LIVE" : "予定";
   card.innerHTML = `
     <div class="thumb">
       <img src="${escapeHtml(item.thumbnail)}" alt="">
@@ -310,7 +452,7 @@ function createCard(item) {
     <div class="stream-body">
       <div class="stream-head">
         <div class="member">${escapeHtml(item.member)}</div>
-        <span class="platform ${escapeHtml(item.platform)}">${escapeHtml(platformLabel)}</span>
+        <span class="platform youtube">YouTube</span>
       </div>
       <p class="title">${escapeHtml(item.title)}</p>
       <div class="meta">${escapeHtml(item.meta)}</div>
@@ -318,13 +460,6 @@ function createCard(item) {
   `;
 
   return card;
-}
-
-function formatPlatform(platform) {
-  return {
-    youtube: "YouTube",
-    twitch: "Twitch"
-  }[platform] || platform;
 }
 
 function updateActionBadge(count) {
@@ -340,11 +475,11 @@ function showMessage(text) {
 function setLoading(loading) {
   state.loading = loading;
   refreshButton.disabled = loading;
-  if (loading) showMessage("\u8aad\u307f\u8fbc\u307f\u4e2d...");
+  if (loading) showMessage("読み込み中...");
 }
 
 function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, (char) => ({
+  return String(value || "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",

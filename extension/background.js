@@ -1,9 +1,7 @@
-importScripts("members.js");
+importScripts("shared.js");
 
-const LIVE_URL = "https://vtuber-live.net/live?filter=vspo";
 const REFRESH_ALARM = "refresh-live-count";
 const REFRESH_MINUTES = 3;
-const STORAGE_KEY = "selectedMemberIds";
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(REFRESH_ALARM, { periodInMinutes: REFRESH_MINUTES });
@@ -28,99 +26,133 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === "local" && changes[STORAGE_KEY]) {
+  if (areaName === "local" && changes[STREAMERS_STORAGE_KEY]) {
     refreshLiveBadge();
   }
 });
 
 async function refreshLiveBadge() {
   try {
-    const [response, selectedMemberIds] = await Promise.all([
-      fetch(LIVE_URL, { cache: "no-store" }),
-      getSelectedMemberIds()
-    ]);
-    if (!response.ok) {
-      throw new Error(`live count fetch failed: ${response.status}`);
+    const streamers = await getStoredStreamers();
+    if (!streamers.length) {
+      setBadge(0);
+      return;
     }
 
-    const html = await response.text();
-    const selectedSet = new Set(selectedMemberIds);
-    const [youtubeCount, twitchCount] = await Promise.all([
-      Promise.resolve(countLiveStreams(html, selectedSet)),
-      countTwitchLiveStreams(selectedSet)
-    ]);
-    setBadge(youtubeCount + twitchCount);
+    const results = await Promise.allSettled(streamers.map(countStreamerLiveStreams));
+    const count = results.reduce((total, result) => total + (result.status === "fulfilled" ? result.value : 0), 0);
+    setBadge(count);
   } catch (error) {
     console.error(error);
     setBadge(null);
   }
 }
 
-async function getSelectedMemberIds() {
-  const values = await chrome.storage.local.get({ [STORAGE_KEY]: VSPO_DEFAULT_MEMBER_IDS });
-  return Array.isArray(values[STORAGE_KEY]) ? values[STORAGE_KEY] : VSPO_DEFAULT_MEMBER_IDS;
+async function countStreamerLiveStreams(streamer) {
+  const response = await fetch(streamer.streamsUrl, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${streamer.streamsUrl}: ${response.status}`);
+
+  const html = await response.text();
+  const data = extractInitialData(html);
+  const renderers = findStreamRenderers(data);
+  const liveIds = new Set();
+
+  renderers.forEach((renderer) => {
+    const videoId = getRendererVideoId(renderer);
+    if (videoId && isLiveRenderer(renderer) && !isFreeChatRenderer(renderer, streamer)) {
+      liveIds.add(videoId);
+    }
+  });
+
+  return liveIds.size;
 }
 
-function countLiveStreams(html, selectedMemberIds) {
-  const main = html.match(/<div class="main_body"[\s\S]*?<\/div>\s*<\/div>\s*<div class="footer_area">/)?.[0] || html;
-  const cards = main.match(/<div class="v_r v_rect_l[\s\S]*?(?=<div class="v_r v_rect_l|<div class="cl footer_pager"|<div class="main_title"|$)/g) || [];
-  return cards.filter((card) => {
-    const channelId = getChannelId(card);
-    return card.includes("class=\"ls_now\"") && channelId && isSelectedChannel(channelId, selectedMemberIds) && !isFreeChatCard(card);
-  }).length;
+function extractInitialData(html) {
+  const match = html.match(/ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+  if (!match) throw new Error("ytInitialData not found");
+  return JSON.parse(match[1]);
 }
 
-function getChannelId(card) {
-  return card.match(/href="\/channel\/(UC[\w-]+)"/)?.[1] || getTwitchLogin(card);
+function findStreamRenderers(root) {
+  const renderers = [];
+  const stack = [root];
+
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object") continue;
+
+    if (value.videoRenderer?.videoId) {
+      renderers.push(value.videoRenderer);
+      continue;
+    }
+
+    if (value.lockupViewModel?.contentId || value.lockupViewModel?.rendererContext?.commandContext) {
+      renderers.push(value.lockupViewModel);
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      stack.push(...value);
+    } else {
+      stack.push(...Object.values(value));
+    }
+  }
+
+  return renderers;
 }
 
-function getTwitchLogin(card) {
-  const login = card.match(/href="https?:\/\/(?:www\.)?twitch\.tv\/(?!videos\/)([A-Za-z0-9_]+)/)?.[1];
-  return login ? login.toLowerCase() : null;
+function isLiveRenderer(renderer) {
+  if (renderer.contentId || renderer.rendererContext?.commandContext) {
+    return /live|ライブ配信中|配信中|watching|視聴中/i.test(getLockupStatusText(renderer));
+  }
+
+  return Boolean(renderer.badges?.some((badge) => {
+    const style = badge.metadataBadgeRenderer?.style || "";
+    const label = badge.metadataBadgeRenderer?.label || "";
+    return style.includes("LIVE") || /live|配信中/i.test(label);
+  })) || getText(renderer.thumbnailOverlays).match(/live|配信中/i);
 }
 
-function isSelectedChannel(channelId, selectedMemberIds) {
-  const memberId = VSPO_CHANNEL_MEMBER_ID_MAP[channelId.toLowerCase()] || channelId;
-  return selectedMemberIds.has(memberId);
+function getRendererVideoId(renderer) {
+  return renderer.videoId || renderer.contentId || renderer.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId || "";
 }
 
-async function countTwitchLiveStreams(selectedMemberIds) {
-  const members = VSPO_MEMBERS
-    .map((member) => ({
-      ...member,
-      twitchLogin: (member.ids || []).find((id) => !id.startsWith("UC"))
-    }))
-    .filter((member) => member.twitchLogin && selectedMemberIds.has(member.id));
+function getLockupStatusText(lockup) {
+  const rows = lockup.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
+  const metadataText = rows
+    .flatMap((row) => row.metadataParts || [])
+    .map((part) => part.text?.content || part.accessibilityLabel || getText(part.text))
+    .filter(Boolean)
+    .join(" ");
+  const badgeText = (lockup.contentImage?.thumbnailViewModel?.overlays || [])
+    .flatMap((overlay) => overlay.thumbnailBottomOverlayViewModel?.badges || [])
+    .map((badge) => getText(badge.thumbnailBadgeViewModel))
+    .filter(Boolean)
+    .join(" ");
 
-  const results = await Promise.allSettled(members.map((member) => isTwitchLive(member.twitchLogin)));
-  return results.filter((result) => result.status === "fulfilled" && result.value).length;
+  return [metadataText, badgeText].filter(Boolean).join(" ");
 }
 
-async function isTwitchLive(login) {
-  const response = await fetch(getTwitchThumbnail(login.toLowerCase()), { method: "HEAD", cache: "no-store" });
-  if (!response.ok) return false;
-
-  const contentLength = Number(response.headers.get("content-length")) || 0;
-  return contentLength > 3000;
+function isFreeChatRenderer(renderer, streamer) {
+  return /free\s*chat|フリー\s*チャット|フリチャ/i.test(`${getText(renderer.title)} ${streamer.name}`);
 }
 
-function getTwitchThumbnail(login) {
-  return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${login}-320x180.jpg`;
-}
-
-function isFreeChatCard(card) {
-  const text = card
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ");
-  return /free\s*chat|\u30d5\u30ea\u30fc\s*\u30c1\u30e3\u30c3\u30c8|\u30d5\u30ea\u30c1\u30e3/i.test(text);
+function getText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(getText).filter(Boolean).join(" ");
+  if (value.simpleText) return value.simpleText;
+  if (value.text) return value.text;
+  if (value.runs) return value.runs.map(getText).filter(Boolean).join("");
+  if (typeof value === "object") return Object.values(value).map(getText).filter(Boolean).join(" ");
+  return "";
 }
 
 function setBadge(count) {
-  chrome.action.setBadgeBackgroundColor({ color: "#5e7ae3" });
+  chrome.action.setBadgeBackgroundColor({ color: "#4f8cff" });
   chrome.action.setBadgeTextColor?.({ color: "#FFFFFF" });
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : "" });
   chrome.action.setTitle({
-    title: count === null ? "Unofficial VSPO Live Status" : `Unofficial VSPO Live Status - \u914d\u4fe1\u4e2d ${count}\u4ef6`
+    title: count === null ? "YouTube Live List" : `YouTube Live List - 配信中 ${count}件`
   });
 }

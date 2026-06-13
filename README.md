@@ -11,15 +11,12 @@ channel names, and service names belong to their respective owners.
 
 ## Browser Extension
 
-The `extension/` directory contains an unofficial Chrome Manifest V3 popup
-extension.
+The `extension/` directory contains a Chrome Manifest V3 popup extension for
+building a custom YouTube live stream list.
 
-It fetches these public VSPO! pages and displays current/scheduled streams:
-
-```text
-https://vtuber-live.net/live?filter=vspo
-https://vtuber-live.net/live_schedule?filter=vspo
-```
+Open the extension options page and add YouTube channels by URL, channel ID, or
+`@handle`. The popup fetches each registered channel's YouTube streams page and
+shows live and scheduled streams.
 
 To try it in Chrome:
 

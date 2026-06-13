@@ -1,95 +1,110 @@
-const STORAGE_KEY = "selectedMemberIds";
-
-const jpMembers = document.querySelector("#jpMembers");
-const enMembers = document.querySelector("#enMembers");
-const jpCount = document.querySelector("#jpCount");
-const enCount = document.querySelector("#enCount");
+const form = document.querySelector("#streamerForm");
+const nameInput = document.querySelector("#nameInput");
+const urlInput = document.querySelector("#urlInput");
+const streamerList = document.querySelector("#streamerList");
+const streamerCount = document.querySelector("#streamerCount");
 const status = document.querySelector("#status");
-const selectAll = document.querySelector("#selectAll");
-const clearAll = document.querySelector("#clearAll");
 
-let selectedMemberIds = new Set(VSPO_DEFAULT_MEMBER_IDS);
-let saveTimer = null;
+let streamers = [];
 
 init();
 
 async function init() {
-  selectedMemberIds = new Set(await getSelectedMemberIds());
-  renderMembers();
-  updateCounts();
+  streamers = await getStoredStreamers();
+  renderStreamers();
 
-  selectAll.addEventListener("click", () => {
-    selectedMemberIds = new Set(VSPO_DEFAULT_MEMBER_IDS);
-    syncChecks();
-    save();
-  });
-
-  clearAll.addEventListener("click", () => {
-    selectedMemberIds = new Set();
-    syncChecks();
-    save();
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await addStreamer();
   });
 }
 
-async function getSelectedMemberIds() {
-  const values = await chrome.storage.local.get({ [STORAGE_KEY]: VSPO_DEFAULT_MEMBER_IDS });
-  return Array.isArray(values[STORAGE_KEY]) ? values[STORAGE_KEY] : VSPO_DEFAULT_MEMBER_IDS;
+async function addStreamer() {
+  const target = normalizeYouTubeTarget(urlInput.value);
+  if (!target) {
+    showStatus("YouTube チャンネル URL、チャンネル ID、または @handle を入力してください。", true);
+    urlInput.focus();
+    return;
+  }
+
+  if (streamers.some((streamer) => streamer.key === target.key)) {
+    showStatus("このチャンネルはすでに追加されています。", true);
+    return;
+  }
+
+  streamers.push({
+    id: createStreamerId(),
+    name: nameInput.value.trim() || target.key,
+    url: target.url,
+    streamsUrl: target.streamsUrl,
+    key: target.key
+  });
+
+  nameInput.value = "";
+  urlInput.value = "";
+  await save();
+  renderStreamers();
 }
 
-function renderMembers() {
-  jpMembers.replaceChildren(...createOptions("JP"));
-  enMembers.replaceChildren(...createOptions("EN"));
-}
+function renderStreamers() {
+  streamerList.replaceChildren();
+  streamerCount.textContent = `${streamers.length}件`;
 
-function createOptions(group) {
-  return VSPO_MEMBERS
-    .filter((member) => member.group === group)
-    .map((member) => {
-      const label = document.createElement("label");
-      label.className = "member-option";
+  if (!streamers.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "まだ配信者が追加されていません。";
+    streamerList.append(empty);
+    return;
+  }
 
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.value = member.id;
-      input.checked = selectedMemberIds.has(member.id);
-      input.addEventListener("change", () => {
-        if (input.checked) {
-          selectedMemberIds.add(member.id);
-        } else {
-          selectedMemberIds.delete(member.id);
-        }
-        save();
-      });
+  streamers.forEach((streamer) => {
+    const item = document.createElement("article");
+    item.className = "streamer-item";
 
-      const name = document.createElement("span");
-      name.textContent = member.name;
+    const body = document.createElement("div");
+    body.className = "streamer-body";
 
-      label.append(input, name);
-      return label;
+    const name = document.createElement("input");
+    name.type = "text";
+    name.value = streamer.name;
+    name.setAttribute("aria-label", "表示名");
+    name.addEventListener("change", async () => {
+      streamer.name = name.value.trim() || streamer.key;
+      await save();
+      renderStreamers();
     });
-}
 
-function syncChecks() {
-  document.querySelectorAll("input[type='checkbox']").forEach((input) => {
-    input.checked = selectedMemberIds.has(input.value);
+    const link = document.createElement("a");
+    link.href = streamer.url;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = streamer.url;
+
+    body.append(name, link);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "remove-button";
+    remove.textContent = "削除";
+    remove.addEventListener("click", async () => {
+      streamers = streamers.filter((item) => item.id !== streamer.id);
+      await save();
+      renderStreamers();
+    });
+
+    item.append(body, remove);
+    streamerList.append(item);
   });
 }
 
-function updateCounts() {
-  const jpTotal = VSPO_MEMBERS.filter((member) => member.group === "JP").length;
-  const enTotal = VSPO_MEMBERS.filter((member) => member.group === "EN").length;
-  const jpSelected = VSPO_MEMBERS.filter((member) => member.group === "JP" && selectedMemberIds.has(member.id)).length;
-  const enSelected = VSPO_MEMBERS.filter((member) => member.group === "EN" && selectedMemberIds.has(member.id)).length;
-  jpCount.textContent = `${jpSelected}/${jpTotal}`;
-  enCount.textContent = `${enSelected}/${enTotal}`;
+async function save() {
+  streamers = sanitizeStreamers(streamers);
+  await chrome.storage.local.set({ [STREAMERS_STORAGE_KEY]: streamers });
+  showStatus("保存しました");
 }
 
-function save() {
-  clearTimeout(saveTimer);
-  updateCounts();
-  status.textContent = "\u4fdd\u5b58\u4e2d...";
-  saveTimer = setTimeout(async () => {
-    await chrome.storage.local.set({ [STORAGE_KEY]: [...selectedMemberIds] });
-    status.textContent = "\u4fdd\u5b58\u3057\u307e\u3057\u305f";
-  }, 120);
+function showStatus(text, isError = false) {
+  status.textContent = text;
+  status.classList.toggle("is-error", isError);
 }
